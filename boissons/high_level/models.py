@@ -1,10 +1,34 @@
-# Create your models here.
 from django.db import models
+
+class JsonMixin:
+    def json(self):
+        data = {"id": self.pk, "type": self.__class__.__name__}
+        for field in self._meta.concrete_fields:
+            if field.name == "id":
+                continue
+            data[field.name] = getattr(self, field.attname)
+        for field in self._meta.many_to_many:
+            data[field.name] = list(
+                getattr(self, field.name).values_list("pk", flat=True)
+            )
+        return data
+
+    def json_extended(self):
+        data = self.json()
+        for field in self._meta.concrete_fields:
+            if field.many_to_one:
+                related = getattr(self, field.name)
+                data[field.name] = related.json_extended() if related else None
+        for field in self._meta.many_to_many:
+            data[field.name] = [
+                o.json_extended() for o in getattr(self, field.name).all()
+            ]
+        return data
 
 
 # ========== MODÈLES DE BASE PAYS & VILLE ==========
 
-class Pays(models.Model):
+class Pays(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     tva = models.IntegerField()
     tarif_electrique = models.IntegerField()
@@ -17,7 +41,7 @@ class Pays(models.Model):
         verbose_name_plural = "Pays"
 
 
-class Ville(models.Model):
+class Ville(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     taxe_immobiliere = models.IntegerField()
     prix_m2 = models.IntegerField()
@@ -30,10 +54,13 @@ class Ville(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        return sum(lieu.costs() for lieu in self.lieu_set.all())
+
 
 # ========== MODÈLES MACHINE ==========
 
-class Machine(models.Model):
+class Machine(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     prix = models.IntegerField()
     duree_de_vie = models.IntegerField()
@@ -43,8 +70,11 @@ class Machine(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        return self.prix
 
-class QuantiteMachine(models.Model):
+
+class QuantiteMachine(JsonMixin, models.Model):
     machine = models.ForeignKey(
         Machine,
         on_delete=models.PROTECT,
@@ -55,18 +85,20 @@ class QuantiteMachine(models.Model):
     def __str__(self):
         return f"{self.nombre} x {self.machine.nom}"
 
+    def costs(self):
+        return self.nombre * self.machine.costs()
+
     class Meta:
         verbose_name_plural = "QuantiteMachines"
 
 
 # ========== MODÈLES LIEU ==========
 
-class Lieu(models.Model):
+class Lieu(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     ville = models.ForeignKey(
         Ville,
         on_delete=models.PROTECT,
-        related_name="+",
     )
     superficie = models.IntegerField()
     machines = models.ManyToManyField(QuantiteMachine)
@@ -75,10 +107,19 @@ class Lieu(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        terrain = self.superficie * self.ville.prix_m2
+        electricite = (
+            self.consommation_electrique * self.ville.pays.tarif_electrique // 100
+        )
+        machines = sum(q.costs() for q in self.machines.all())
+        ventes = sum(p.costs() for p in PointDeVente.objects.filter(lieu=self))
+        return terrain + electricite + machines + ventes
+
 
 # ========== MODÈLES PRODUIT ==========
 
-class Produit(models.Model):
+class Produit(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     prix_de_vente = models.IntegerField()
     duree_de_vie = models.IntegerField()
@@ -87,10 +128,14 @@ class Produit(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        prix = PrixProduit.objects.filter(produit=self).order_by("prix_achat").first()
+        return prix.prix_achat if prix else 0
+
 
 # ========== MODÈLE ABSTRAIT QUANTITE ==========
 
-class QuantiteProduitBase(models.Model):
+class QuantiteProduitBase(JsonMixin, models.Model):
     quantite = models.IntegerField()
     produit = models.ForeignKey(
         Produit,
@@ -104,6 +149,9 @@ class QuantiteProduitBase(models.Model):
     def __str__(self):
         return f"{self.quantite} x {self.produit.nom}"
 
+    def costs(self):
+        return self.quantite * self.produit.costs()
+
 
 # ========== MODÈLES QUANTITÉ DE PRODUITS ==========
 
@@ -116,7 +164,7 @@ class Stock(QuantiteProduitBase):
 
 # ========== MODÈLES OPÉRATION ==========
 
-class Operation(models.Model):
+class Operation(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     operation_suivante = models.ForeignKey(
         'self',
@@ -138,10 +186,13 @@ class Operation(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        return self.cout
+
 
 # ========== MODÈLES TRANSPORT ==========
 
-class Transport(models.Model):
+class Transport(JsonMixin, models.Model):
     nombre_palettes = models.IntegerField()
     cout = models.IntegerField()
     delai = models.IntegerField()
@@ -159,10 +210,13 @@ class Transport(models.Model):
     def __str__(self):
         return f"{self.depart.nom} → {self.arrivee.nom}"
 
+    def costs(self):
+        return self.cout
+
 
 # ========== MODÈLES VENTE ==========
 
-class PointDeVente(models.Model):
+class PointDeVente(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
     lieu = models.ForeignKey(
         Lieu,
@@ -179,17 +233,21 @@ class PointDeVente(models.Model):
     def __str__(self):
         return self.nom
 
+    def costs(self):
+        salaire = self.heures_de_travail * self.lieu.ville.pays.salaire_minimum
+        return self.stock.costs() + salaire
+
 
 # ========== MODÈLES FOURNISSEUR ==========
 
-class Fournisseur(models.Model):
+class Fournisseur(JsonMixin, models.Model):
     nom = models.CharField(max_length=100)
 
     def __str__(self):
         return self.nom
 
 
-class PrixProduit(models.Model):
+class PrixProduit(JsonMixin, models.Model):
     produit = models.ForeignKey(
         Produit,
         on_delete=models.PROTECT,
@@ -211,7 +269,7 @@ class PrixProduit(models.Model):
 
 # ========== MODÈLES FACTURE ==========
 
-class Facture(models.Model):
+class Facture(JsonMixin, models.Model):
     quantite_produits = models.IntegerField()
     reduction = models.IntegerField()
     point_de_vente = models.ForeignKey(
